@@ -1,4 +1,9 @@
 #define _DEFAULT_SOURCE // DT_*
+
+#include "myassert.h"
+
+#include <stdio.h>
+
 #include <sys/stat.h>
 #include <dirent.h> // fdopendir
 #include <stdbool.h>
@@ -7,29 +12,22 @@
 #include <fcntl.h> // openat
 #include <unistd.h> // chdir
 
-#include "myassert.h"
-
-
 struct level {
 	DIR* d;
-	struct stat info;
+	const char* name;
+	struct timespec latest[2];
 };
 
-bool maybe_adjust_time(struct timespec* a, const struct timespec* b) {
-	if(a->tv_sec < b->tv_sec) return false;
-	if(a->tv_sec == b->tv_sec &&
-		 a->tv_nsec < b->tv_nsec)
+bool before(struct timespec a, const struct timespec b) {
+	if(a.tv_sec > b.tv_sec) return false;
+	if(a.tv_sec == b.tv_sec &&
+		 a.tv_nsec >= b.tv_nsec)
 		return false;
-	memcpy(a,b,sizeof(*a));
 	return true;
 }
 
-void maybe_adjust(struct level* a, const struct level* b) {
-	if(maybe_adjust_time(&a->info.st_mtim, &b->info.st_mtim)) {
-		assert(a->d != NULL);
-		struct timespec times[2] = { a->info.st_atim, a->info.st_mtim };
-		assert(0==futimens(dirfd(a->d),times));
-	}
+void print_timespec(struct timespec spec) {
+	printf("%d:%d",spec.tv_sec,spec.tv_nsec);
 }
 
 DIR* opendirat(int parent, const char* name) {
@@ -38,34 +36,78 @@ DIR* opendirat(int parent, const char* name) {
 	return fdopendir(dir);
 }
 
+
 void one_level(struct level* top) {
 	struct dirent* ent;
-	struct timespec latest[2];
+	bool dirty = false;
+	// ignore the directory's mtime, because the contents could make
+	// it older, or newer
 	while((ent = readdir(top->d))) {
-		assert(ent->d_type != DT_UNKNOWN); // filesystem should support this... use ext4
-		struct level sub;
+		// filesystem should support this... use ext4
+		assert(ent->d_type != DT_UNKNOWN);
+		struct level sub = {};
+
 		if(ent->d_type == DT_DIR) {
+			if(ent->d_name[0] == '.') {
+				if(ent->d_name[1] == '.') {
+					if(ent->d_name[2] == '\0')
+						continue;
+				} else if(ent->d_name[1] == '\0')
+					continue;
+			}
+			printf("descending into %s\n",ent->d_name);
 			sub.d = opendirat(dirfd(top->d), ent->d_name);
+			sub.name = ent->d_name;
 			assert(sub.d != NULL);
-			assert(0==fstat(dirfd(sub.d), &sub.info));
-			maybe_adjust_time(&sub.info.st_mtim, &top->info.st_mtim);
 			one_level(&sub);
+			if(before(top->latest[1], sub.latest[1])) {
+				top->latest[0] = sub.latest[0];
+				top->latest[1] = sub.latest[1];
+				dirty = true;
+			}
 			assert(0==closedir(sub.d));
 		} else {
-			assert(0==fstatat(dirfd(top->d), ent->d_name, &sub.info, 0));
+			struct stat info;
+			if(0==fstatat(dirfd(top->d), ent->d_name, &info,
+										// let's not go into /proc/self/mounts thanks
+										AT_SYMLINK_NOFOLLOW)) {
+				if(before(top->latest[1],info.st_mtim)) {
+					top->latest[0] = info.st_atim;
+					top->latest[1] = info.st_mtim;
+					dirty = true;
+				}
+			} else {
+				error(0,errno,"%s no mtime?",ent->d_name);
+				continue;
+			}
 		}
-		maybe_adjust(top, &sub);
+	}
+	if(dirty) {
+		struct stat info;
+		// only adjust utime if it changed
+
+		assert(0==fstat(dirfd(top->d), &info));
+		if(info.st_mtim.tv_sec == top->latest[1].tv_sec &&
+			 info.st_mtim.tv_nsec == top->latest[1].tv_nsec)
+			return;
+
+		printf("adjusting %s ",top->name);
+		print_timespec(top->latest[1]);
+		putchar('\n');
+		assert(0==futimens(dirfd(top->d),top->latest));
 	}
 }
 
 int main(int argc, char *argv[])
 {
-	if(argc == 2)
-		assert(0==chdir(argv[1]));
 	struct level top;
-	top.d = opendir(".");
+	if(argc == 2) {
+		top.name = argv[1];
+	} else {
+		top.name = ".";
+	}
+	top.d = opendir(top.name);
 	assert(NULL != top.d);
-	assert(0==fstat(dirfd(top.d),&top.info));
 	one_level(&top);
 	return 0;
 }
